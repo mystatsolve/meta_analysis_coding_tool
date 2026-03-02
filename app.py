@@ -645,6 +645,237 @@ def make_effect_chart(df: pd.DataFrame, font_name):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# [L] 팩트체크 함수
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_factcheck_prompt(extracted_json: str) -> str:
+    """
+    팩트체크용 AI 프롬프트 생성.
+    1차 추출된 JSON 데이터를 포함시켜, 검증 AI가 PDF와 직접 대조하도록 지시.
+
+    매개변수:
+        extracted_json (str): 1차 추출 시 AI가 반환한 원본 JSON 문자열
+
+    반환값:
+        str: 검증 지시 + 추출 데이터가 포함된 프롬프트 문자열
+    """
+    return f"""당신은 메타분석 데이터 검증 전문가입니다.
+아래 [1차 추출 데이터]가 첨부된 논문 PDF의 실제 수치와 일치하는지 검증해주세요.
+
+[1차 추출 데이터]:
+{extracted_json}
+
+PDF를 직접 참조하여 각 수치를 대조한 후, 아래 형식의 **순수 JSON만** 반환하세요 (설명 텍스트 없음).
+
+{{
+  "overall_status": "ok" 또는 "has_errors" 또는 "uncertain",
+  "summary": "전체 검증 요약 (1~2문장, 한국어)",
+  "error_count": 오류 개수(정수),
+  "uncertain_count": 불명확 개수(정수),
+  "study_check": {{
+    "n_TG": {{"status": "ok"|"error"|"uncertain", "original": <원본값>, "verified": <검증값 또는 null>, "note": "근거 위치 (예: Table 1)"}},
+    "n_CG": {{"status": "...", "original": ..., "verified": ..., "note": "..."}}
+  }},
+  "outcomes_check": [
+    {{
+      "outcome_en": "결과변수 영문명",
+      "outcome_kr": "결과변수 한국어명",
+      "checks": {{
+        "TG_pre_M":   {{"status": "ok"|"error"|"uncertain", "original": <숫자 또는 null>, "verified": <숫자 또는 null>, "note": "근거 위치"}},
+        "TG_pre_SD":  {{"status": "...", "original": ..., "verified": ..., "note": "..."}},
+        "TG_post_M":  {{"status": "...", "original": ..., "verified": ..., "note": "..."}},
+        "TG_post_SD": {{"status": "...", "original": ..., "verified": ..., "note": "..."}},
+        "CG_pre_M":   {{"status": "...", "original": ..., "verified": ..., "note": "..."}},
+        "CG_pre_SD":  {{"status": "...", "original": ..., "verified": ..., "note": "..."}},
+        "CG_post_M":  {{"status": "...", "original": ..., "verified": ..., "note": "..."}},
+        "CG_post_SD": {{"status": "...", "original": ..., "verified": ..., "note": "..."}}
+      }}
+    }}
+  ]
+}}
+
+검증 기준:
+- "ok": PDF의 수치와 정확히 일치
+- "error": 불일치 → verified 필드에 PDF의 실제 수치 입력
+- "uncertain": PDF에서 명확히 확인 불가 (해당 표 없음, 값 불명확 등)
+"""
+
+
+def factcheck_with_claude(pdf_bytes: bytes, extracted_json: str, api_key: str, model_id: str) -> str:
+    """
+    Claude로 팩트체크: PDF 원본 + 1차 추출 데이터를 함께 전송하여 교차 검증.
+
+    매개변수:
+        pdf_bytes (bytes): PDF 파일 바이너리
+        extracted_json (str): 1차 추출 AI의 원본 JSON 응답
+        api_key (str): Anthropic API 키
+        model_id (str): 검증에 사용할 Claude 모델 ID
+
+    반환값:
+        str: 팩트체크 결과 JSON 문자열
+    """
+    import anthropic
+    client = anthropic.Anthropic(api_key=api_key)
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")  # PDF → base64
+    prompt = build_factcheck_prompt(extracted_json)  # 추출 데이터 포함 프롬프트 생성
+
+    resp = client.messages.create(
+        model=model_id,
+        max_tokens=8192,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "document",  # Claude PDF 네이티브 타입
+                    "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+                },
+                {"type": "text", "text": prompt},  # 검증 지시 프롬프트
+            ],
+        }],
+    )
+    return resp.content[0].text
+
+
+def factcheck_with_openai(pdf_bytes: bytes, extracted_json: str, api_key: str, model_id: str) -> str:
+    """
+    OpenAI Vision으로 팩트체크: PDF 이미지 + 1차 추출 데이터를 함께 전송하여 교차 검증.
+
+    매개변수:
+        pdf_bytes (bytes): PDF 파일 바이너리
+        extracted_json (str): 1차 추출 AI의 원본 JSON 응답
+        api_key (str): OpenAI API 키
+        model_id (str): 검증에 사용할 GPT 모델 ID
+
+    반환값:
+        str: 팩트체크 결과 JSON 문자열
+    """
+    client = _make_openai_client(api_key)   # httpx 충돌 우회 클라이언트
+    images = pdf_to_images_b64(pdf_bytes, dpi=150, max_pages=20)  # PDF → 이미지 변환
+    prompt = build_factcheck_prompt(extracted_json)
+
+    # 프롬프트 + 이미지 콘텐츠 구성
+    content: list = [{"type": "text", "text": prompt}]
+    for img_b64 in images:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{img_b64}", "detail": "high"},
+        })
+
+    resp = client.chat.completions.create(
+        model=model_id,
+        max_tokens=8192,
+        messages=[{"role": "user", "content": content}],
+    )
+    choice = resp.choices[0]
+    if hasattr(choice.message, "refusal") and choice.message.refusal:
+        raise ValueError(f"모델 거절: {choice.message.refusal}")
+    result = choice.message.content
+    if not result:
+        raise ValueError(f"빈 응답 (finish_reason={choice.finish_reason})")
+    return result
+
+
+def factcheck_pdf(pdf_bytes: bytes, verify_provider: str, api_key: str,
+                  model_id: str, extracted_json: str) -> str:
+    """
+    팩트체크 디스패처: 검증 제공자에 따라 적절한 함수로 라우팅.
+
+    매개변수:
+        pdf_bytes (bytes): PDF 파일 바이너리
+        verify_provider (str): 검증에 사용할 API 제공자 이름
+        api_key (str): 검증 제공자의 API 키
+        model_id (str): 검증에 사용할 모델 ID
+        extracted_json (str): 1차 추출 AI의 원본 JSON
+
+    반환값:
+        str: 팩트체크 결과 JSON 문자열
+    """
+    if "Claude" in verify_provider:
+        return factcheck_with_claude(pdf_bytes, extracted_json, api_key, model_id)
+    else:
+        return factcheck_with_openai(pdf_bytes, extracted_json, api_key, model_id)
+
+
+def parse_factcheck_to_df(fc_data: dict) -> pd.DataFrame:
+    """
+    팩트체크 결과 딕셔너리를 비교 DataFrame으로 변환.
+    각 행: 결과변수명 / 항목 / 원본값 / 검증값 / 상태 / 비고
+
+    매개변수:
+        fc_data (dict): AI가 반환한 팩트체크 JSON을 파싱한 딕셔너리
+
+    반환값:
+        pd.DataFrame: 비교 결과 표
+    """
+    # 상태 코드 → 사용자 표시 텍스트 매핑
+    STATUS_LABEL = {"ok": "✅ 일치", "error": "❌ 오류", "uncertain": "❓ 불명확"}
+    # 검증 대상 수치 필드 목록
+    FIELDS = ["TG_pre_M", "TG_pre_SD", "TG_post_M", "TG_post_SD",
+              "CG_pre_M", "CG_pre_SD", "CG_post_M", "CG_post_SD"]
+
+    rows = []
+
+    # 연구 기본 정보 검증 결과 (n_TG, n_CG)
+    for key, val in fc_data.get("study_check", {}).items():
+        rows.append({
+            "결과변수":  "연구 정보",
+            "항목":      key,
+            "원본값":    val.get("original", ""),
+            "검증값":    val.get("verified", ""),  # 오류일 때 수정값
+            "상태":      STATUS_LABEL.get(val.get("status", ""), val.get("status", "")),
+            "근거/비고": val.get("note", ""),
+        })
+
+    # 결과 변수별 수치 검증 결과
+    for oc in fc_data.get("outcomes_check", []):
+        label = f"{oc.get('outcome_kr', '')} ({oc.get('outcome_en', '')})"
+        for field in FIELDS:
+            chk = oc.get("checks", {}).get(field)
+            if chk is None:   # 해당 필드 검증 결과 없으면 건너뜀
+                continue
+            rows.append({
+                "결과변수":  label,
+                "항목":      field,
+                "원본값":    chk.get("original", ""),
+                "검증값":    chk.get("verified", ""),
+                "상태":      STATUS_LABEL.get(chk.get("status", ""), chk.get("status", "")),
+                "근거/비고": chk.get("note", ""),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def apply_corrections(outcomes: list, fc_data: dict) -> list:
+    """
+    팩트체크에서 발견된 오류(status="error")를 outcomes 목록에 적용.
+    verified 값이 있는 항목만 수정하고, 나머지는 원본 유지.
+
+    매개변수:
+        outcomes (list): 현재 결과 변수 딕셔너리 목록
+        fc_data (dict): 팩트체크 결과 딕셔너리
+
+    반환값:
+        list: 수정이 적용된 outcomes 복사본
+    """
+    corrected = [dict(o) for o in outcomes]  # 원본 보호를 위한 딥 복사
+    NUMERIC_FIELDS = ["TG_pre_M", "TG_pre_SD", "TG_post_M", "TG_post_SD",
+                      "CG_pre_M", "CG_pre_SD", "CG_post_M", "CG_post_SD"]
+
+    for oc_check in fc_data.get("outcomes_check", []):
+        en = oc_check.get("outcome_en", "")  # 결과 변수 영문명으로 매칭
+        for o in corrected:
+            if o.get("outcome_en", "") == en:  # 일치하는 결과 변수 찾기
+                for field in NUMERIC_FIELDS:
+                    chk = oc_check.get("checks", {}).get(field, {})
+                    # 오류이고 검증값이 있는 경우에만 수정
+                    if chk.get("status") == "error" and chk.get("verified") is not None:
+                        o[field] = chk["verified"]
+                break  # 해당 변수 찾았으면 다음 oc_check로
+
+    return corrected
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  UI 섹션 시작
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -822,7 +1053,11 @@ if run_btn:
             outcomes=data["outcomes"],       # 결과 변수 목록
             raw_json=raw_text,               # AI 원본 응답 (디버깅용)
             used_provider=provider,          # 사용한 API 제공자 이름
+            pdf_bytes=pdf_bytes,             # 팩트체크 시 재사용을 위해 PDF 바이너리 보존
         )
+        # 새 분석 시작 시 이전 팩트체크 결과 초기화
+        for k in ["factcheck_done", "factcheck_data", "factcheck_raw", "factcheck_provider"]:
+            st.session_state.pop(k, None)
         progress.progress(100, text="완료!")
         status.success("✅ 분석 완료!")
 
@@ -1027,3 +1262,190 @@ dl1.download_button(
 with st.expander("🔧 AI 원본 JSON 응답 보기"):
     # AI가 반환한 원본 텍스트를 JSON 형식으로 하이라이팅하여 표시
     st.code(st.session_state.get("raw_json", ""), language="json")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 팩트체크 — 교차 검증
+# ══════════════════════════════════════════════════════════════════════════════
+st.divider()
+st.subheader("🔍 팩트체크 — 교차 검증")
+st.markdown(
+    "1차 추출에 사용한 AI와 **다른 AI**가 동일한 PDF를 다시 읽어 수치의 정확성을 교차 검증합니다.  \n"
+    "불일치 항목이 발견되면 수정값을 확인하고 **수정사항 적용** 버튼으로 Cohen's d를 재계산할 수 있습니다."
+)
+
+# ── 검증 제공자 결정 (추출한 제공자의 반대) ─────────────────────────────────
+# used_pv: 1차 추출 시 사용한 API 제공자 이름
+if "Claude" in used_pv:
+    verify_provider_name = "🟢 OpenAI ChatGPT"   # Claude로 추출 → OpenAI로 검증
+else:
+    verify_provider_name = "🔵 Anthropic Claude"  # OpenAI로 추출 → Claude로 검증
+
+vconf = PROVIDERS[verify_provider_name]  # 검증 제공자 설정 딕셔너리
+
+# 추출↔검증 제공자 흐름 표시
+fc_badge = (
+    f'<div style="background:#37474F;color:white;padding:8px 16px;border-radius:6px;'
+    f'display:inline-block;font-size:0.9rem;">'
+    f'추출&nbsp;&nbsp;<b>{used_pv}</b>&nbsp;&nbsp;→&nbsp;&nbsp;검증&nbsp;&nbsp;<b>{verify_provider_name}</b></div>'
+)
+st.markdown(fc_badge, unsafe_allow_html=True)
+st.write("")
+
+# ── 검증 모델 & API Key 입력 ─────────────────────────────────────────────────
+fc_c1, fc_c2 = st.columns(2)
+
+with fc_c1:
+    # 검증 제공자의 모델 목록을 드롭다운으로 표시
+    verify_model_label = st.selectbox(
+        "검증 모델 선택",
+        list(vconf["models"].keys()),
+        key="verify_model",
+    )
+    verify_model_id = vconf["models"][verify_model_label]  # 표시명 → 실제 모델 ID
+
+with fc_c2:
+    # 검증 제공자의 API 키 입력 (1차 추출 키와 별도)
+    verify_api_key = st.text_input(
+        f"{verify_provider_name} API Key",
+        type="password",
+        placeholder=vconf["key_placeholder"],
+        help=vconf["key_help"],
+        key="verify_api_key",
+    )
+
+# ── 팩트체크 실행 버튼 ───────────────────────────────────────────────────────
+fc_btn_col, _ = st.columns([1, 3])
+fc_btn = fc_btn_col.button(
+    "🔍 팩트체크 시작",
+    type="primary",
+    use_container_width=True,
+    disabled=not verify_api_key,  # API Key 없으면 비활성화
+    key="factcheck_btn",
+)
+
+if fc_btn and verify_api_key:
+    _pdf = st.session_state.get("pdf_bytes")  # 저장된 PDF 바이너리 재사용
+    if not _pdf:
+        st.error("[오류] PDF 데이터를 찾을 수 없습니다. 분석을 다시 실행해주세요.")
+    else:
+        with st.spinner(f"{verify_provider_name}가 PDF를 재검토하는 중... (30초~2분 소요)"):
+            try:
+                # 팩트체크 API 호출: PDF + 1차 추출 JSON을 함께 전송
+                fc_raw = factcheck_pdf(
+                    _pdf,
+                    verify_provider_name,
+                    verify_api_key,
+                    verify_model_id,
+                    st.session_state.get("raw_json", ""),  # 1차 추출 원본 JSON
+                )
+                # 결과 파싱
+                fc_json_str = extract_json(fc_raw)
+                fc_data = json.loads(fc_json_str)
+
+                # 팩트체크 결과를 session_state에 저장
+                st.session_state.update(
+                    factcheck_done=True,
+                    factcheck_data=fc_data,
+                    factcheck_raw=fc_raw,
+                    factcheck_provider=verify_provider_name,
+                )
+                st.rerun()  # 결과 표시를 위해 페이지 재렌더링
+
+            except json.JSONDecodeError as _e:
+                st.error(f"[오류] 팩트체크 JSON 파싱 실패: {_e}")
+                with st.expander("검증 AI 원본 응답"):
+                    st.code(fc_raw, language="json")
+            except Exception as _e:
+                st.error(f"[오류] 팩트체크 실패: {_e}")
+                with st.expander("오류 상세"):
+                    st.exception(_e)
+
+# ── 팩트체크 결과 표시 ────────────────────────────────────────────────────────
+if st.session_state.get("factcheck_done"):
+    fc_data      = st.session_state["factcheck_data"]
+    fc_pv        = st.session_state.get("factcheck_provider", "")
+    overall      = fc_data.get("overall_status", "")
+    summary      = fc_data.get("summary", "")
+    error_count  = fc_data.get("error_count", 0)
+    uncertain_count = fc_data.get("uncertain_count", 0)
+
+    # 전체 상태 배지
+    STATUS_COLOR = {"ok": "#2E7D32", "has_errors": "#C62828", "uncertain": "#E65100"}
+    STATUS_TEXT  = {"ok": "✅ 이상 없음", "has_errors": "❌ 오류 발견", "uncertain": "❓ 불명확 항목 있음"}
+    badge_bg = STATUS_COLOR.get(overall, "#37474F")
+    badge_txt = STATUS_TEXT.get(overall, overall)
+
+    st.markdown(
+        f'<div style="background:{badge_bg};color:white;padding:8px 16px;border-radius:6px;'
+        f'display:inline-block;font-size:0.95rem;font-weight:bold;">{badge_txt}</div>',
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+    # 요약 문장 및 통계
+    if summary:
+        st.info(f"**검증 요약:** {summary}")
+
+    # 오류/불명확 개수 표시
+    cnt_c1, cnt_c2, cnt_c3 = st.columns(3)
+    cnt_c1.metric("검증 제공자", fc_pv.split()[1] if " " in fc_pv else fc_pv)
+    cnt_c2.metric("오류 항목", f"{error_count}개", delta=None)
+    cnt_c3.metric("불명확 항목", f"{uncertain_count}개", delta=None)
+
+    # ── 상세 비교 테이블 ──────────────────────────────────────────────────────
+    st.markdown("#### 항목별 상세 검증 결과")
+    fc_df = parse_factcheck_to_df(fc_data)  # 비교 DataFrame 생성
+
+    if not fc_df.empty:
+        # 상태 열 기준으로 색상 하이라이트
+        def _highlight_status(row):
+            """상태에 따라 행 배경색 결정"""
+            s = row.get("상태", "")
+            if "오류" in s:
+                return ["background-color: #FFEBEE"] * len(row)   # 연빨강
+            elif "불명확" in s:
+                return ["background-color: #FFF3E0"] * len(row)   # 연주황
+            elif "일치" in s:
+                return ["background-color: #E8F5E9"] * len(row)   # 연초록
+            return [""] * len(row)
+
+        st.dataframe(
+            fc_df.style.apply(_highlight_status, axis=1),
+            use_container_width=True,
+            height=min(600, 45 + len(fc_df) * 36),  # 행 수에 비례한 높이
+        )
+
+        # 오류 항목만 별도 표시
+        error_rows = fc_df[fc_df["상태"].str.contains("오류", na=False)]
+        if not error_rows.empty:
+            st.markdown(f"#### ⚠️ 오류 발견 항목 ({len(error_rows)}개)")
+            st.dataframe(
+                error_rows[["결과변수", "항목", "원본값", "검증값", "근거/비고"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # ── 수정사항 적용 버튼 ────────────────────────────────────────────
+            st.warning(
+                f"위 {len(error_rows)}개 항목에서 원본값과 다른 수치가 발견되었습니다.  \n"
+                "'**수정사항 적용**'을 클릭하면 검증값으로 데이터가 업데이트되고 Cohen's d가 재계산됩니다."
+            )
+            apply_col, _ = st.columns([1, 3])
+            if apply_col.button("✏️ 수정사항 적용 후 재계산", type="primary", use_container_width=True):
+                # 오류 항목에 검증값 적용
+                corrected_outcomes = apply_corrections(
+                    st.session_state["outcomes"], fc_data
+                )
+                st.session_state["outcomes"] = corrected_outcomes  # 수정된 outcomes 저장
+                # 팩트체크 결과 초기화 (수정 적용 후 재검증 유도)
+                for k in ["factcheck_done", "factcheck_data", "factcheck_raw", "factcheck_provider"]:
+                    st.session_state.pop(k, None)
+                st.success("수정사항이 적용되었습니다. Cohen's d가 재계산됩니다.")
+                st.rerun()
+        else:
+            st.success("모든 수치가 PDF 원문과 일치합니다.")
+
+    # 검증 AI 원본 응답 확인
+    with st.expander("🔧 검증 AI 원본 JSON 응답 보기"):
+        st.code(st.session_state.get("factcheck_raw", ""), language="json")
