@@ -18,6 +18,187 @@
 
 ---
 
+## 통계 데이터 추출 과정
+
+### 전체 파이프라인
+
+```
+논문 PDF
+   │
+   ▼
+[Claude]  PDF 원본 base64 인코딩 → document 타입으로 직접 전송
+[ChatGPT] pymupdf로 페이지별 PNG 변환(150dpi) → image_url Vision 전송
+   │
+   ▼
+AI 모델 (Claude / GPT-4o 등)
+   - 논문 전체를 읽고 결과 섹션·테이블 식별
+   - 실험군(TG)과 통제군(CG) 자동 구분
+   - 사전(pre)·사후(post) 평균과 SD 추출
+   - F값, 유의성 표시 추출
+   - 순수 JSON 형식으로 반환
+   │
+   ▼
+JSON 파싱 (extract_json → json.loads)
+   - 마크다운 코드블록 제거
+   - { } 범위 추출
+   │
+   ▼
+효과 크기 계산 (calc_effects)
+   - Cohen's d, Hedges' g 자동 계산
+   │
+   ▼
+pandas DataFrame → CSV 다운로드
+```
+
+---
+
+### Step 1 — PDF 전송 방식
+
+#### Anthropic Claude (권장)
+Claude API는 **PDF 네이티브 지원** 기능을 제공합니다.
+PDF 파일 전체를 base64로 인코딩하여 `document` 타입 콘텐츠로 전송하므로
+텍스트·표·수식의 레이아웃이 그대로 보존됩니다.
+
+```python
+# Claude API 전송 구조
+{
+  "type": "document",
+  "source": {
+    "type": "base64",
+    "media_type": "application/pdf",
+    "data": "<base64 인코딩된 PDF>"
+  }
+}
+```
+
+#### OpenAI ChatGPT
+OpenAI API는 PDF를 직접 지원하지 않으므로
+`pymupdf` 라이브러리로 **페이지별 PNG 이미지**로 변환 후 Vision API로 전송합니다.
+
+```
+PDF → [pymupdf 렌더링 150dpi] → 페이지1.png, 페이지2.png, ...
+     → base64 인코딩 → image_url (detail: "high") 로 전송
+```
+
+| 설정값 | 의미 |
+|--------|------|
+| `dpi=150` | 논문 표·수식이 선명하게 보이는 해상도 |
+| `max_pages=20` | 토큰 한도 초과 방지 (페이지당 ~765 토큰) |
+| `detail="high"` | 고해상도 분석 모드 (표 내 숫자 정확도 향상) |
+
+---
+
+### Step 2 — AI 프롬프트와 추출 규칙
+
+AI에게 전달되는 지시문(프롬프트)은 다음 6가지 규칙을 포함합니다.
+
+| 규칙 | 내용 |
+|------|------|
+| **① 전체 테이블 추출** | 논문의 모든 결과 테이블에서 Pre/Post 평균(M)과 SD를 추출 |
+| **② ± 기호 처리** | `45.0±6.08` → `M=45.0, SD=6.08` 으로 분리 |
+| **③ 군 구분** | 훈련군·실험군·EG·TG → 실험군(TG) / 통제군·대조군·CG → 통제군(CG) |
+| **④ F값 처리** | `*`, `**` 표시는 note 필드에 포함 (예: `F=9.65, p<0.01`) |
+| **⑤ 결측값 처리** | 측정값 없으면 `null` (계산 불가 시 Cohen's d도 null) |
+| **⑥ 서브그룹 분류** | 논문 결과 섹션 제목 기준 (신체구성, 건강관련체력, 심리적 변인 등) |
+
+---
+
+### Step 3 — AI가 반환하는 JSON 구조
+
+AI는 아래 형식의 **순수 JSON**을 반환합니다 (설명 텍스트 없음).
+
+```json
+{
+  "study": {
+    "authors": "Song et al.",
+    "year": "2013",
+    "journal": "Journal of Exercise Science",
+    "title": "Effects of exercise on body composition...",
+    "n_TG": 15,
+    "n_CG": 15,
+    "population": "비만 중년 여성",
+    "intervention": "12주 복합운동 프로그램",
+    "duration": "12주, 주 3회, 60분/회"
+  },
+  "outcomes": [
+    {
+      "outcome_kr": "체중",
+      "outcome_en": "Body weight",
+      "unit": "kg",
+      "subgroup_kr": "신체구성",
+      "subgroup_en": "Body composition",
+      "TG_pre_M": 72.3,
+      "TG_pre_SD": 8.1,
+      "TG_post_M": 68.5,
+      "TG_post_SD": 7.9,
+      "CG_pre_M": 71.8,
+      "CG_pre_SD": 7.6,
+      "CG_post_M": 72.1,
+      "CG_post_SD": 7.8,
+      "F_group": null,
+      "F_time": 12.45,
+      "F_interaction": 9.65,
+      "note": "Time p<0.01; G×T p<0.05"
+    }
+  ]
+}
+```
+
+---
+
+### Step 4 — Cohen's d 계산 과정 (단계별 예시)
+
+위 체중 데이터를 예로 들면:
+
+**① 변화량(Δ) 계산**
+```
+Δ_TG = 68.5 - 72.3 = -3.8 kg   (실험군: 3.8kg 감소)
+Δ_CG = 72.1 - 71.8 = +0.3 kg   (통제군: 0.3kg 증가)
+```
+
+**② 사전 측정 합동 표준편차 계산 (n_TG=15, n_CG=15)**
+```
+df = 15 + 15 - 2 = 28
+
+SD_pooled = sqrt(((15-1)×8.1² + (15-1)×7.6²) / 28)
+          = sqrt((14×65.61 + 14×57.76) / 28)
+          = sqrt((918.54 + 808.64) / 28)
+          = sqrt(61.72)
+          = 7.86
+```
+
+**③ Cohen's d 계산**
+```
+d = (Δ_TG - Δ_CG) / SD_pooled
+  = (-3.8 - 0.3) / 7.86
+  = -4.1 / 7.86
+  = -0.52   → 중간 효과 크기
+```
+
+**④ Hedges' g 소표본 보정**
+```
+J = 1 - 3 / (4×28 - 1) = 1 - 3/111 = 0.973
+
+g = -0.52 × 0.973 = -0.51
+```
+
+> **부호 해석**: d < 0이면 실험군이 더 감소(또는 통제군이 더 증가),
+> 체중 감소가 목표인 경우 음수 d가 중재 효과를 의미합니다.
+
+---
+
+### Step 5 — JSON 파싱 안전 처리
+
+AI가 JSON 외 텍스트를 포함하는 경우를 자동으로 처리합니다.
+
+| 케이스 | 처리 방법 |
+|--------|----------|
+| ` ```json ... ``` ` 마크다운 블록 | 정규식으로 내용만 추출 |
+| 앞뒤 설명 텍스트 포함 | `{` ~ `}` 범위만 잘라냄 |
+| 순수 JSON | 그대로 파싱 |
+
+---
+
 ## 효과 크기 계산 공식
 
 **Cohen's d (Morris, 2008)**
